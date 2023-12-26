@@ -236,10 +236,9 @@ OpKind :: enum {
 	DIVIDE,
 	SINE,
 	COSINE,
-	POWER,
+	POWER, // used to implement exponent
 	MIN, // NOTE: clip is implemented as a series of min and max
 	MAX,
-	// EXPONENT,
 	// TANGENT,
 	// ATAN2,
 	// TANH,
@@ -662,6 +661,13 @@ power :: proc {
 	power_var2,
 }
 
+exp :: proc(x: Var, name: string = "_exp") -> Var {
+	e := var_copy(x.graph, []f64{math.E}, "math.E")
+	z := power_vars(e, x, name)
+	return z
+}
+
+
 /////////////////////////////////////////////////
 // called vmin to not conflict with builtin min
 
@@ -1060,4 +1066,17 @@ test_readme :: proc(t: ^testing.T) {
 	z: Var = mult(x, y, "z")
 
 	uncertainty_collect(graph, targets = []Var{z}, knobs = []Var{x, y})
+}
+
+@(test)
+test_exp :: proc(t: ^testing.T) {
+	graph := graph_init()
+	x := var_copy(graph, []f64{1, 2, 3, 4}, "x")
+	y := exp(x, "y")
+
+	uncertainty(graph, x)
+
+	for i in 0 ..< len(x.val) {
+		testing.expect(t, math.abs(graph.vars[y.id].dval[i] - math.exp_f64(graph.vars[x.id].val[i])) < 1e-6)
+	}
 }
