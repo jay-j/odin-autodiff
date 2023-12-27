@@ -212,6 +212,12 @@ uncertainty :: proc(graph: ^Graph, vary: Var, error: f64 = 1.0) {
 			sin_(graph, op)
 		case .COSINE:
 			cos_(graph, op)
+		case .TANGENT:
+			tan_(graph, op)
+		case .ATAN2:
+			atan2_(graph, op)
+		case .TANH:
+			tanh_(graph, op)
 		case .POWER:
 			power_(graph, op)
 		case .MIN:
@@ -236,12 +242,12 @@ OpKind :: enum {
 	DIVIDE,
 	SINE,
 	COSINE,
+	TANGENT,
+	ATAN2,
+	TANH,
 	POWER, // used to implement exponent
 	MIN, // NOTE: clip is implemented as a series of min and max
 	MAX,
-	// TANGENT,
-	// ATAN2,
-	// TANH,
 }
 
 op_debug :: proc(graph: ^Graph) {
@@ -569,6 +575,139 @@ cos :: proc(x: Var, name: string = "_cos") -> Var {
 
 	cos_(graph, op)
 	return z
+}
+
+/////////////////////////////////////////////////
+
+@(private)
+tan_ :: proc(graph: ^Graph, op: Op) {
+	// Actually perform the TANGENT operation
+	assert(op.kind == OpKind.TANGENT)
+	inputs: ^Var = &graph.vars[op.inputs[0]]
+	output: ^Var = &graph.vars[op.output]
+
+	#no_bounds_check for i in 0 ..< len(inputs.val) {
+		output.val[i] = math.tan_f64(inputs.val[i])
+		output.dval[i] = inputs.dval[i] / math.pow_f64(math.cos_f64(inputs.val[i]), 2.0)
+	}
+}
+
+tan :: proc(x: Var, name: string = "_tan") -> Var {
+	graph := x.graph
+
+	z := var(graph, size = len(x.val), name = name)
+
+	op: Op = {
+		inputs = [2]u64{x.id, 0},
+		output = z.id,
+		kind = OpKind.TANGENT,
+	}
+	append(&graph.ops, op)
+
+	tan_(graph, op)
+	return z
+}
+
+/////////////////////////////////////////////////
+
+@(private)
+tanh_ :: proc(graph: ^Graph, op: Op) {
+	// Actually perform the TANH operation
+	assert(op.kind == OpKind.TANH)
+	inputs: ^Var = &graph.vars[op.inputs[0]]
+	output: ^Var = &graph.vars[op.output]
+
+	#no_bounds_check for i in 0 ..< len(inputs.val) {
+		output.val[i] = math.tanh(inputs.val[i])
+		output.dval[i] = inputs.dval[i] / math.pow_f64(math.cosh(inputs.val[i]), 2.0)
+	}
+}
+
+tanh :: proc(x: Var, name: string = "_tanh") -> Var {
+	graph := x.graph
+
+	z := var(graph, size = len(x.val), name = name)
+
+	op: Op = {
+		inputs = [2]u64{x.id, 0},
+		output = z.id,
+		kind = OpKind.TANH,
+	}
+	append(&graph.ops, op)
+
+	tanh_(graph, op)
+	return z
+}
+
+
+/////////////////////////////////////////////////
+
+@(private)
+atan2_ :: proc(graph: ^Graph, op: Op) {
+	// Actually perform the ATAN2 operation
+	assert(op.kind == OpKind.ATAN2)
+	in_y: ^Var = &graph.vars[op.inputs[0]]
+	in_x: ^Var = &graph.vars[op.inputs[1]]
+	output: ^Var = &graph.vars[op.output]
+
+	// TODO pull some constants out of loops where things don't change
+	if len(in_y.val) == len(in_x.val) {
+		#no_bounds_check for i in 0 ..< len(in_y.val) {
+			output.val[i] = math.atan2_f64(in_y.val[i], in_x.val[i])
+			denom: f64 = 1.0 / (math.pow_f64(in_x.val[i], 2.0) + math.pow_f64(in_y.val[i], 2.0))
+			output.dval[i] = (in_y.dval[i] * in_x.val[i] - in_x.dval[i] * in_y.val[i]) * denom
+		}
+	} else {
+		if len(in_y.val) == 1 {
+			#no_bounds_check for i in 0 ..< len(in_x.val) {
+				output.val[i] = math.atan2_f64(in_y.val[0], in_x.val[i])
+				denom: f64 = 1.0 / (math.pow_f64(in_x.val[i], 2.0) + math.pow_f64(in_y.val[0], 2.0))
+				output.dval[i] = (in_y.dval[0] * in_x.val[i] - in_x.dval[i] * in_y.val[0]) * denom
+			}
+		}
+		if len(in_x.val) == 1 {
+			#no_bounds_check for i in 0 ..< len(in_y.val) {
+				output.val[i] = math.atan2_f64(in_y.val[i], in_x.val[0])
+				denom: f64 = 1.0 / (math.pow_f64(in_x.val[0], 2.0) + math.pow_f64(in_y.val[i], 2.0))
+				output.dval[i] = (in_y.dval[i] * in_x.val[0] - in_x.dval[0] * in_y.val[i]) * denom
+			}
+		}
+	}
+}
+
+atan2_vars :: proc(y, x: Var, name: string = "_atan2") -> Var {
+	assert(x.graph == y.graph)
+	graph := x.graph
+
+	z := var(graph, size = max(len(x.val), len(y.val)), name = name)
+
+	op: Op = {
+		inputs = [2]u64{y.id, x.id},
+		output = z.id,
+		kind = OpKind.ATAN2,
+	}
+	append(&graph.ops, op)
+
+	atan2_(graph, op)
+	return z
+}
+
+atan2_var1 :: proc(y: f64, x: Var, name: string = "_atan2") -> Var {
+	yvar := var_copy(x.graph, []f64{y}, fmt.aprintf("%E", y, x.graph.allocator))
+	z := atan2_vars(yvar, x, name)
+	return z
+}
+
+atan2_var2 :: proc(y: Var, x: f64, name: string = "_atan2") -> Var {
+	xvar := var_copy(y.graph, []f64{x}, fmt.aprintf("%E", x, y.graph.allocator))
+	z := atan2_vars(y, xvar, name)
+	return z
+}
+
+atan2 :: proc {
+	atan2_vars,
+	atan2_var1,
+	atan2_var2,
 }
 
 /////////////////////////////////////////////////
@@ -1078,5 +1217,83 @@ test_exp :: proc(t: ^testing.T) {
 
 	for i in 0 ..< len(x.val) {
 		testing.expect(t, math.abs(graph.vars[y.id].dval[i] - math.exp_f64(graph.vars[x.id].val[i])) < 1e-6)
+	}
+}
+
+@(test)
+test_tan :: proc(t: ^testing.T) {
+	graph := graph_init()
+
+	x := var_copy(graph, []f64{-0.5, 0.0, 1.0}, "x")
+
+	y := tan(x, "y")
+	uncertainty(graph, x)
+
+	testing.expect(t, math.abs(graph.vars[y.id].val[0] - (-0.5463024)) < 1e-6)
+	testing.expect(t, math.abs(graph.vars[y.id].val[1] - (0)) < 1e-6)
+	testing.expect(t, math.abs(graph.vars[y.id].val[2] - (1.5574077)) < 1e-6)
+
+	testing.expect(t, math.abs(graph.vars[y.id].dval[0] - (1.2984464)) < 1e-6)
+	testing.expect(t, math.abs(graph.vars[y.id].dval[1] - (1)) < 1e-6)
+	testing.expect(t, math.abs(graph.vars[y.id].dval[2] - (3.4255188)) < 1e-6)
+}
+
+@(test)
+test_tanh :: proc(t: ^testing.T) {
+	graph := graph_init()
+	x := var_copy(graph, []f64{-0.5, 0.0, 1.0}, "x")
+
+	y := tanh(x, "y")
+	uncertainty(graph, x)
+
+	graph_print(graph)
+	testing.expect(t, math.abs(graph.vars[y.id].val[0] - (-0.4621171)) < 1e-6)
+	testing.expect(t, math.abs(graph.vars[y.id].val[1] - (0)) < 1e-6)
+	testing.expect(t, math.abs(graph.vars[y.id].val[2] - (0.7615941)) < 1e-6)
+
+	testing.expect(t, math.abs(graph.vars[y.id].dval[0] - (0.7864477)) < 1e-6)
+	testing.expect(t, math.abs(graph.vars[y.id].dval[1] - (1)) < 1e-6)
+	testing.expect(t, math.abs(graph.vars[y.id].dval[2] - (0.4199743)) < 1e-6)
+}
+
+@(test)
+test_atan2 :: proc(t: ^testing.T) {
+	graph := graph_init()
+	x := var_copy(graph, []f64{-0.5, 0.0, 1.2, 0.9, 1.1, 0.0, -0.8, -1.4}, "x")
+	y := var_copy(graph, []f64{1.2, 0.9, 0.7, 0.0, -0.6, -1.1, -1.2, 0.0}, "y")
+
+	z := atan2(y, x, "z")
+
+	{
+		// Check basic results of atan2 in all four quadrants
+		z_answers := []f64{1.9655874, 1.5707963, 0.5280744, 0.0, -0.4993467, -1.5707963, -2.1587989, 3.1415926}
+		assert(len(z.val) == len(z_answers))
+
+		end := len(z_answers) - 1
+		z_answers[end] *= math.sign(graph.vars[z.id].val[end]) // don't care about matching sign of pi
+
+		for i in 0 ..< len(z_answers) {
+			testing.expect(t, math.abs(graph.vars[z.id].val[i] - z_answers[i]) < 1e-6, fmt.tprintf("z error\n"))
+		}
+	}
+
+	{
+		uncertainty(graph, x)
+		dz_answers := []f64{-0.7100591, -1.1111111, -0.3626943, 0.0, 0.3821656, 0.9090909, 0.5769230, 0.0}
+		assert(len(z.val) == len(dz_answers))
+
+		for i in 0 ..< len(dz_answers) {
+			testing.expect(t, math.abs(graph.vars[z.id].dval[i] - dz_answers[i]) < 1e-6, fmt.tprintf("dz/dx error\n"))
+		}
+	}
+
+	{
+		uncertainty(graph, y)
+		dz_answers := []f64{-0.29585799, 0.0, 0.62176166, 1.11111111, 0.70063694, 0.0, -0.38461538, -0.71428571}
+		assert(len(z.val) == len(dz_answers))
+
+		for i in 0 ..< len(dz_answers) {
+			testing.expect(t, math.abs(graph.vars[z.id].dval[i] - dz_answers[i]) < 1e-6, fmt.tprintf("dz/dy error\n"))
+		}
 	}
 }
