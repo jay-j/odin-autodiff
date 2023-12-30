@@ -17,10 +17,10 @@ import "core:testing"
 
 Var :: struct {
 	graph: ^Graph, // store a pointer to the graph owning this variable so that it doesn't have to be specifed as a procedure argument
-	name:  string, // for humans; optional
 	id:    u64, // index in graph.vars[]
-	val:   []f64,
-	dval:  []f64,
+	size:  u64, // length of val and dval; since their length must be the same, save 8 bytes by storing size separately
+	val:   [^]f64,
+	dval:  [^]f64,
 }
 
 Op :: struct {
@@ -33,6 +33,7 @@ Graph :: struct {
 	// Forward-accumulation dependencies built-in by the order of operations added to the graph.
 	ops:       [dynamic]Op,
 	vars:      [dynamic]Var,
+	vars_name: [dynamic]string, // Separate from Var to reduce memory of computing uncertainty()
 
 	// Storage for the graph, including raw variable data
 	allocator: runtime.Allocator,
@@ -80,12 +81,12 @@ main :: proc() {
 
 
 // STEP 1: Init a compute graph with an allocator to hold memory for the data.
-graph_init :: proc(size := 50, allocator := context.allocator) -> ^Graph {
+graph_init :: proc(memory_mb := 50, capacity_initial := 50, allocator := context.allocator) -> ^Graph {
 	context.allocator = allocator
 	graph: ^Graph = new(Graph)
 
 	// create an allocator and allocate stuff for the graph
-	data, backing_alloc_err := make([]u8, size * mem.Megabyte)
+	data, backing_alloc_err := make([]u8, memory_mb * mem.Megabyte)
 	if backing_alloc_err != nil {
 		fmt.printf("[ERROR] Cannot allocate backing memory for graph arena: '%v'\n", backing_alloc_err)
 	}
@@ -97,15 +98,16 @@ graph_init :: proc(size := 50, allocator := context.allocator) -> ^Graph {
 	// graph.allocator = mem.tracking_allocator(&track)
 
 	// put stuff on there to start with; try to bunch this up front so it is faster to jump over
-	graph.vars = make([dynamic]Var, len = 0, cap = 30, allocator = graph.allocator)
-	graph.ops = make([dynamic]Op, len = 0, cap = 50, allocator = graph.allocator)
+	graph.vars = make([dynamic]Var, len = 0, cap = capacity_initial, allocator = graph.allocator)
+	graph.ops = make([dynamic]Op, len = 0, cap = capacity_initial, allocator = graph.allocator)
+	graph.vars_name = make([dynamic]string, len = 0, cap = capacity_initial, allocator = graph.allocator)
 
 	return graph
 }
 
 graph_print :: proc(graph: ^Graph) {
 	for var in graph.vars {
-		fmt.printf("Var: %v\n", var.name)
+		fmt.printf("Var: %v\n", graph.vars_name[var.id])
 		fmt.printf(" val : %v\n", var.val)
 		fmt.printf(" dval: %v\n", var.dval)
 	}
@@ -120,19 +122,20 @@ var :: proc {
 	var_copy,
 }
 
-var_reserve :: proc(graph: ^Graph, size: int, name: string) -> Var {
+var_reserve :: proc(graph: ^Graph, size: u64, name: string) -> Var {
 	x := Var {
 		graph = graph,
 		id    = u64(len(graph.vars)),
-		name  = name,
+		size = size,
 	}
 
 	// No data was provided to copy, allocate according to size
 	assert(size != 0)
-	x.val = make([]f64, size, allocator = graph.allocator)
-	x.dval = make([]f64, len(x.val), allocator = graph.allocator)
+	x.val = make([^]f64, size, allocator = graph.allocator)
+	x.dval = make([^]f64, x.size, allocator = graph.allocator)
 
 	append(&graph.vars, x)
+	append(&graph.vars_name, name)
 	return x
 }
 
@@ -140,20 +143,24 @@ var_copy :: proc(graph: ^Graph, val: []f64, name: string) -> Var {
 	x := Var {
 		graph = graph,
 		id    = u64(len(graph.vars)),
-		name  = name,
+		size = u64(len(val)),
 	}
 
 	// Data was provided; copy it in
 	assert(len(val) != 0)
-	x.val = make([]f64, len(val), allocator = graph.allocator)
-	copy(x.val, val)
-	x.dval = make([]f64, len(x.val), allocator = graph.allocator)
+	x.val = make([^]f64, x.size, allocator = graph.allocator)
+	copy(x.val[0:x.size], val)
+	// for i in 0..<x.size{
+		// x.val[i] = val[i]
+	// }
+	x.dval = make([^]f64, x.size, allocator = graph.allocator)
 
 	append(&graph.vars, x)
+	append(&graph.vars_name, name)
 	return x
 }
 
-var_linspace :: proc(graph: ^Graph, low, high: f64, size: int, name: string) -> Var {
+var_linspace :: proc(graph: ^Graph, low, high: f64, size: u64, name: string) -> Var {
 	var := var_reserve(graph, size = size, name = name)
 	assert(low < high)
 
@@ -175,7 +182,12 @@ uncertainty_collect :: proc(graph: ^Graph, targets: []Var, knobs: []Var) {
 
 		// now record effect on targets
 		for target in targets {
-			fmt.printf("d'%v'/d'%v' = %v\n", target.name, knob.name, graph.vars[target.id].dval)
+			fmt.printf(
+				"d'%v'/d'%v' = %v\n",
+				graph.vars_name[target.id],
+				graph.vars_name[knob.id],
+				graph.vars[target.id].dval,
+			)
 		}
 		fmt.printf("\n")
 	}
@@ -186,9 +198,9 @@ uncertainty_collect :: proc(graph: ^Graph, targets: []Var, knobs: []Var) {
 // Assume this initial injected uncertainty is a scalar (not a slice)
 uncertainty :: proc(graph: ^Graph, vary: Var, error: f64 = 1.0) {
 	for var in &graph.vars {
-		slice.fill(var.dval, 0)
+		slice.fill(var.dval[0:var.size], 0)
 	}
-	slice.fill(graph.vars[vary.id].dval, error)
+	slice.fill(graph.vars[vary.id].dval[0:vary.size], error)
 
 	// Recompute the graph
 	for op_id in 0 ..< len(graph.ops) {
@@ -253,7 +265,13 @@ OpKind :: enum {
 op_debug :: proc(graph: ^Graph) {
 	op_id := len(graph.ops) - 1
 	op := graph.ops[op_id]
-	fmt.printf("Op %v is %v %v %v\n", op_id, graph.vars[op.inputs[0]].name, op.kind, graph.vars[op.inputs[1]].name)
+	fmt.printf(
+		"Op %v is %v %v %v\n",
+		op_id,
+		graph.vars_name[graph.vars[op.inputs[0]].id],
+		op.kind,
+		graph.vars_name[graph.vars[op.inputs[1]].id],
+	)
 }
 
 /////////////////////////////////////////////////
@@ -263,20 +281,20 @@ add_ :: proc(graph: ^Graph, op: Op) {
 	assert(op.kind == OpKind.ADD)
 	inputs: [2]^Var = {&graph.vars[op.inputs[0]], &graph.vars[op.inputs[1]]}
 	output: ^Var = &graph.vars[op.output]
-	if len(inputs[0].val) == len(inputs[1].val) {
-		#no_bounds_check for i in 0 ..< len(inputs[0].val) {
+	if inputs[0].size == inputs[1].size {
+		#no_bounds_check for i in 0 ..< inputs[0].size {
 			output.val[i] = inputs[0].val[i] + inputs[1].val[i]
 			output.dval[i] = inputs[0].dval[i] + inputs[1].dval[i]
 		}
 	} else {
-		if len(inputs[0].val) == 1 {
-			#no_bounds_check for i in 0 ..< len(inputs[1].val) {
+		if inputs[0].size == 1 {
+			#no_bounds_check for i in 0 ..< inputs[1].size {
 				output.val[i] = inputs[0].val[0] + inputs[1].val[i]
 				output.dval[i] = inputs[0].dval[0] + inputs[1].dval[i]
 			}
 		}
-		if len(inputs[1].val) == 1 {
-			#no_bounds_check for i in 0 ..< len(inputs[0].val) {
+		if inputs[1].size == 1 {
+			#no_bounds_check for i in 0 ..< inputs[0].size {
 				output.val[i] = inputs[0].val[i] + inputs[1].val[0]
 				output.dval[i] = inputs[0].dval[i] + inputs[1].dval[0]
 			}
@@ -288,7 +306,7 @@ add_vars :: proc(x, y: Var, name: string = "_add") -> Var {
 	assert(x.graph == y.graph)
 	graph := x.graph
 
-	z := var(graph, size = max(len(x.val), len(y.val)), name = name)
+	z := var(graph, size = max(x.size, y.size), name = name)
 
 	op: Op = {
 		inputs = [2]u64{x.id, y.id},
@@ -326,20 +344,20 @@ sub_ :: proc(graph: ^Graph, op: Op) {
 	inputs: [2]^Var = {&graph.vars[op.inputs[0]], &graph.vars[op.inputs[1]]}
 	output: ^Var = &graph.vars[op.output]
 
-	if len(inputs[0].val) == len(inputs[1].val) {
-		#no_bounds_check for i in 0 ..< len(inputs[0].val) {
+	if inputs[0].size == inputs[1].size {
+		#no_bounds_check for i in 0 ..< inputs[0].size {
 			output.val[i] = inputs[0].val[i] - inputs[1].val[i]
 			output.dval[i] = inputs[0].dval[i] - inputs[1].dval[i]
 		}
 	} else {
-		if len(inputs[0].val) == 1 {
-			#no_bounds_check for i in 0 ..< len(inputs[1].val) {
+		if inputs[0].size == 1 {
+			#no_bounds_check for i in 0 ..< inputs[1].size {
 				output.val[i] = inputs[0].val[0] - inputs[1].val[i]
 				output.dval[i] = inputs[0].dval[0] - inputs[1].dval[i]
 			}
 		}
-		if len(inputs[1].val) == 1 {
-			#no_bounds_check for i in 0 ..< len(inputs[0].val) {
+		if inputs[1].size == 1 {
+			#no_bounds_check for i in 0 ..< inputs[0].size {
 				output.val[i] = inputs[0].val[i] - inputs[1].val[0]
 				output.dval[i] = inputs[0].dval[i] - inputs[1].dval[0]
 			}
@@ -351,7 +369,7 @@ sub_vars :: proc(x, y: Var, name: string = "_sub") -> Var {
 	assert(x.graph == y.graph)
 	graph := x.graph
 
-	z := var(graph, size = max(len(x.val), len(y.val)), name = name)
+	z := var(graph, size = max(x.size, y.size), name = name)
 
 	op: Op = {
 		inputs = [2]u64{x.id, y.id},
@@ -390,20 +408,20 @@ mult_ :: proc(graph: ^Graph, op: Op) {
 	inputs: [2]^Var = {&graph.vars[op.inputs[0]], &graph.vars[op.inputs[1]]}
 	output: ^Var = &graph.vars[op.output]
 
-	if len(inputs[0].val) == len(inputs[1].val) {
-		#no_bounds_check for i in 0 ..< len(inputs[0].val) {
+	if inputs[0].size == inputs[1].size {
+		#no_bounds_check for i in 0 ..< inputs[0].size {
 			output.val[i] = inputs[0].val[i] * inputs[1].val[i]
 			output.dval[i] = inputs[0].val[i] * inputs[1].dval[i] + inputs[0].dval[i] * inputs[1].val[i]
 		}
 	} else {
-		if len(inputs[0].val) == 1 {
-			#no_bounds_check for i in 0 ..< len(inputs[1].val) {
+		if inputs[0].size == 1 {
+			#no_bounds_check for i in 0 ..< inputs[1].size {
 				output.val[i] = inputs[0].val[0] * inputs[1].val[i]
 				output.dval[i] = inputs[0].val[0] - inputs[1].dval[i] + inputs[0].dval[0] * inputs[1].val[i]
 			}
 		}
-		if len(inputs[1].val) == 1 {
-			#no_bounds_check for i in 0 ..< len(inputs[0].val) {
+		if inputs[1].size == 1 {
+			#no_bounds_check for i in 0 ..< inputs[0].size {
 				output.val[i] = inputs[0].val[i] * inputs[1].val[0]
 				output.dval[i] = inputs[0].val[i] * inputs[1].dval[0] + inputs[0].dval[i] * inputs[1].val[0]
 			}
@@ -415,7 +433,7 @@ mult_vars :: proc(x, y: Var, name: string = "_mul") -> Var {
 	assert(x.graph == y.graph)
 	graph := x.graph
 
-	z := var(graph, size = max(len(x.val), len(y.val)), name = name)
+	z := var(graph, size = max(x.size, y.size), name = name)
 
 	op: Op = {
 		inputs = [2]u64{x.id, y.id},
@@ -454,24 +472,24 @@ div_ :: proc(graph: ^Graph, op: Op) {
 	output: ^Var = &graph.vars[op.output]
 
 	// TODO pull some constants out of loops where things don't change
-	if len(inputs[0].val) == len(inputs[1].val) {
-		#no_bounds_check for i in 0 ..< len(inputs[0].val) {
+	if inputs[0].size == inputs[1].size {
+		#no_bounds_check for i in 0 ..< inputs[0].size {
 			output.val[i] = inputs[0].val[i] / inputs[1].val[i]
 			output.dval[i] =
 				inputs[0].dval[i] / inputs[1].val[i] -
 				inputs[0].val[i] * inputs[1].dval[i] / (inputs[1].val[i] * inputs[1].val[i])
 		}
 	} else {
-		if len(inputs[0].val) == 1 {
-			#no_bounds_check for i in 0 ..< len(inputs[1].val) {
+		if inputs[0].size == 1 {
+			#no_bounds_check for i in 0 ..< inputs[1].size {
 				output.val[i] = inputs[0].val[0] / inputs[1].val[i]
 				output.dval[i] =
 					inputs[0].dval[0] / inputs[1].val[i] -
 					inputs[0].val[0] * inputs[1].dval[i] / (inputs[1].val[i] * inputs[1].val[i])
 			}
 		}
-		if len(inputs[1].val) == 1 {
-			#no_bounds_check for i in 0 ..< len(inputs[0].val) {
+		if inputs[1].size == 1 {
+			#no_bounds_check for i in 0 ..< inputs[0].size {
 				output.val[i] = inputs[0].val[i] / inputs[1].val[0]
 				output.dval[i] =
 					inputs[0].dval[i] / inputs[1].val[0] -
@@ -485,7 +503,7 @@ div_vars :: proc(x, y: Var, name: string = "_div") -> Var {
 	assert(x.graph == y.graph)
 	graph := x.graph
 
-	z := var(graph, size = max(len(x.val), len(y.val)), name = name)
+	z := var(graph, size = max(x.size, y.size), name = name)
 
 	op: Op = {
 		inputs = [2]u64{x.id, y.id},
@@ -524,7 +542,7 @@ sin_ :: proc(graph: ^Graph, op: Op) {
 	inputs: ^Var = &graph.vars[op.inputs[0]]
 	output: ^Var = &graph.vars[op.output]
 
-	#no_bounds_check for i in 0 ..< len(inputs.val) {
+	#no_bounds_check for i in 0 ..< inputs.size {
 		output.val[i] = math.sin_f64(inputs.val[i])
 		output.dval[i] = math.cos_f64(inputs.val[i]) * inputs.dval[i]
 	}
@@ -533,7 +551,7 @@ sin_ :: proc(graph: ^Graph, op: Op) {
 sin :: proc(x: Var, name: string = "_sin") -> Var {
 	graph := x.graph
 
-	z := var(graph, size = len(x.val), name = name)
+	z := var(graph, size = x.size, name = name)
 
 	op: Op = {
 		inputs = [2]u64{x.id, 0},
@@ -555,7 +573,7 @@ cos_ :: proc(graph: ^Graph, op: Op) {
 	inputs: ^Var = &graph.vars[op.inputs[0]]
 	output: ^Var = &graph.vars[op.output]
 
-	#no_bounds_check for i in 0 ..< len(inputs.val) {
+	#no_bounds_check for i in 0 ..< inputs.size {
 		output.val[i] = math.cos_f64(inputs.val[i])
 		output.dval[i] = -math.sin_f64(inputs.val[i]) * inputs.dval[i]
 	}
@@ -564,7 +582,7 @@ cos_ :: proc(graph: ^Graph, op: Op) {
 cos :: proc(x: Var, name: string = "_cos") -> Var {
 	graph := x.graph
 
-	z := var(graph, size = len(x.val), name = name)
+	z := var(graph, size = x.size, name = name)
 
 	op: Op = {
 		inputs = [2]u64{x.id, 0},
@@ -586,7 +604,7 @@ tan_ :: proc(graph: ^Graph, op: Op) {
 	inputs: ^Var = &graph.vars[op.inputs[0]]
 	output: ^Var = &graph.vars[op.output]
 
-	#no_bounds_check for i in 0 ..< len(inputs.val) {
+	#no_bounds_check for i in 0 ..< inputs.size {
 		output.val[i] = math.tan_f64(inputs.val[i])
 		output.dval[i] = inputs.dval[i] / math.pow_f64(math.cos_f64(inputs.val[i]), 2.0)
 	}
@@ -595,7 +613,7 @@ tan_ :: proc(graph: ^Graph, op: Op) {
 tan :: proc(x: Var, name: string = "_tan") -> Var {
 	graph := x.graph
 
-	z := var(graph, size = len(x.val), name = name)
+	z := var(graph, size = x.size, name = name)
 
 	op: Op = {
 		inputs = [2]u64{x.id, 0},
@@ -617,7 +635,7 @@ tanh_ :: proc(graph: ^Graph, op: Op) {
 	inputs: ^Var = &graph.vars[op.inputs[0]]
 	output: ^Var = &graph.vars[op.output]
 
-	#no_bounds_check for i in 0 ..< len(inputs.val) {
+	#no_bounds_check for i in 0 ..< inputs.size {
 		output.val[i] = math.tanh(inputs.val[i])
 		output.dval[i] = inputs.dval[i] / math.pow_f64(math.cosh(inputs.val[i]), 2.0)
 	}
@@ -626,7 +644,7 @@ tanh_ :: proc(graph: ^Graph, op: Op) {
 tanh :: proc(x: Var, name: string = "_tanh") -> Var {
 	graph := x.graph
 
-	z := var(graph, size = len(x.val), name = name)
+	z := var(graph, size = x.size, name = name)
 
 	op: Op = {
 		inputs = [2]u64{x.id, 0},
@@ -651,22 +669,22 @@ atan2_ :: proc(graph: ^Graph, op: Op) {
 	output: ^Var = &graph.vars[op.output]
 
 	// TODO pull some constants out of loops where things don't change
-	if len(in_y.val) == len(in_x.val) {
-		#no_bounds_check for i in 0 ..< len(in_y.val) {
+	if in_y.size == in_x.size {
+		#no_bounds_check for i in 0 ..< in_y.size {
 			output.val[i] = math.atan2_f64(in_y.val[i], in_x.val[i])
 			denom: f64 = 1.0 / (math.pow_f64(in_x.val[i], 2.0) + math.pow_f64(in_y.val[i], 2.0))
 			output.dval[i] = (in_y.dval[i] * in_x.val[i] - in_x.dval[i] * in_y.val[i]) * denom
 		}
 	} else {
-		if len(in_y.val) == 1 {
-			#no_bounds_check for i in 0 ..< len(in_x.val) {
+		if in_y.size == 1 {
+			#no_bounds_check for i in 0 ..< in_x.size {
 				output.val[i] = math.atan2_f64(in_y.val[0], in_x.val[i])
 				denom: f64 = 1.0 / (math.pow_f64(in_x.val[i], 2.0) + math.pow_f64(in_y.val[0], 2.0))
 				output.dval[i] = (in_y.dval[0] * in_x.val[i] - in_x.dval[i] * in_y.val[0]) * denom
 			}
 		}
-		if len(in_x.val) == 1 {
-			#no_bounds_check for i in 0 ..< len(in_y.val) {
+		if in_x.size == 1 {
+			#no_bounds_check for i in 0 ..< in_y.size {
 				output.val[i] = math.atan2_f64(in_y.val[i], in_x.val[0])
 				denom: f64 = 1.0 / (math.pow_f64(in_x.val[0], 2.0) + math.pow_f64(in_y.val[i], 2.0))
 				output.dval[i] = (in_y.dval[i] * in_x.val[0] - in_x.dval[0] * in_y.val[i]) * denom
@@ -679,7 +697,7 @@ atan2_vars :: proc(y, x: Var, name: string = "_atan2") -> Var {
 	assert(x.graph == y.graph)
 	graph := x.graph
 
-	z := var(graph, size = max(len(x.val), len(y.val)), name = name)
+	z := var(graph, size = max(x.size, y.size), name = name)
 
 	op: Op = {
 		inputs = [2]u64{y.id, x.id},
@@ -721,8 +739,8 @@ power_ :: proc(graph: ^Graph, op: Op) {
 
 	// TODO pull some constants out of loops where things don't change?
 	// BUG math.ln_f64 can't handle values < 0!
-	if len(inputs[0].val) == len(inputs[1].val) {
-		#no_bounds_check for i in 0 ..< len(inputs[0].val) {
+	if inputs[0].size == inputs[1].size {
+		#no_bounds_check for i in 0 ..< inputs[0].size {
 			output.val[i] = math.pow_f64(inputs[0].val[i], inputs[1].val[i])
 			output.dval[i] =
 				inputs[1].val[i] * math.pow_f64(inputs[0].val[i], inputs[1].val[i] - 1.0) * inputs[0].dval[i]
@@ -735,8 +753,8 @@ power_ :: proc(graph: ^Graph, op: Op) {
 			}
 		}
 	} else {
-		if len(inputs[0].val) == 1 {
-			#no_bounds_check for i in 0 ..< len(inputs[1].val) {
+		if inputs[0].size == 1 {
+			#no_bounds_check for i in 0 ..< inputs[1].size {
 				output.val[i] = math.pow_f64(inputs[0].val[0], inputs[1].val[i])
 				output.dval[i] =
 					inputs[1].val[i] * math.pow_f64(inputs[0].val[0], inputs[1].val[i] - 1.0) * inputs[0].dval[0]
@@ -749,8 +767,8 @@ power_ :: proc(graph: ^Graph, op: Op) {
 				}
 			}
 		}
-		if len(inputs[1].val) == 1 {
-			#no_bounds_check for i in 0 ..< len(inputs[0].val) {
+		if inputs[1].size == 1 {
+			#no_bounds_check for i in 0 ..< inputs[0].size {
 				output.val[i] = math.pow_f64(inputs[0].val[i], inputs[1].val[0])
 				output.dval[i] =
 					inputs[1].val[0] * math.pow_f64(inputs[0].val[i], inputs[1].val[0] - 1.0) * inputs[0].dval[i]
@@ -770,7 +788,7 @@ power_vars :: proc(x, power: Var, name: string = "_pow") -> Var {
 	assert(x.graph == power.graph)
 	graph := x.graph
 
-	z := var(graph, size = max(len(x.val), len(power.val)), name = name)
+	z := var(graph, size = max(x.size, power.size), name = name)
 
 	op: Op = {
 		inputs = [2]u64{x.id, power.id},
@@ -817,8 +835,8 @@ vmin_ :: proc(graph: ^Graph, op: Op) {
 	inputs: [2]^Var = {&graph.vars[op.inputs[0]], &graph.vars[op.inputs[1]]}
 	output: ^Var = &graph.vars[op.output]
 
-	if len(inputs[0].val) == len(inputs[1].val) {
-		#no_bounds_check for i in 0 ..< len(inputs[0].val) {
+	if inputs[0].size == inputs[1].size {
+		#no_bounds_check for i in 0 ..< inputs[0].size {
 			if inputs[0].val[i] > inputs[1].val[i] {
 				output.val[i] = inputs[1].val[i]
 				output.dval[i] = inputs[1].dval[i]
@@ -828,8 +846,8 @@ vmin_ :: proc(graph: ^Graph, op: Op) {
 			}
 		}
 	} else {
-		if len(inputs[0].val) == 1 {
-			#no_bounds_check for i in 0 ..< len(inputs[1].val) {
+		if inputs[0].size == 1 {
+			#no_bounds_check for i in 0 ..< inputs[1].size {
 				if inputs[0].val[0] > inputs[1].val[i] {
 					output.val[i] = inputs[1].val[i]
 					output.dval[i] = inputs[1].dval[i]
@@ -839,8 +857,8 @@ vmin_ :: proc(graph: ^Graph, op: Op) {
 				}
 			}
 		}
-		if len(inputs[1].val) == 1 {
-			#no_bounds_check for i in 0 ..< len(inputs[0].val) {
+		if inputs[1].size == 1 {
+			#no_bounds_check for i in 0 ..< inputs[0].size {
 				if inputs[0].val[i] > inputs[1].val[0] {
 					output.val[i] = inputs[1].val[0]
 					output.dval[i] = inputs[1].dval[0]
@@ -857,7 +875,7 @@ vmin_vars :: proc(x, y: Var, name: string = "_min") -> Var {
 	assert(x.graph == y.graph)
 	graph := x.graph
 
-	z := var(graph, size = max(len(x.val), len(y.val)), name = name)
+	z := var(graph, size = max(x.size, y.size), name = name)
 
 	op: Op = {
 		inputs = [2]u64{x.id, y.id},
@@ -898,8 +916,8 @@ vmax_ :: proc(graph: ^Graph, op: Op) {
 	inputs: [2]^Var = {&graph.vars[op.inputs[0]], &graph.vars[op.inputs[1]]}
 	output: ^Var = &graph.vars[op.output]
 
-	if len(inputs[0].val) == len(inputs[1].val) {
-		#no_bounds_check for i in 0 ..< len(inputs[0].val) {
+	if inputs[0].size == inputs[1].size {
+		#no_bounds_check for i in 0 ..< inputs[0].size {
 			if inputs[0].val[i] < inputs[1].val[i] {
 				output.val[i] = inputs[1].val[i]
 				output.dval[i] = inputs[1].dval[i]
@@ -909,8 +927,8 @@ vmax_ :: proc(graph: ^Graph, op: Op) {
 			}
 		}
 	} else {
-		if len(inputs[0].val) == 1 {
-			#no_bounds_check for i in 0 ..< len(inputs[1].val) {
+		if inputs[0].size == 1 {
+			#no_bounds_check for i in 0 ..< inputs[1].size {
 				if inputs[0].val[0] < inputs[1].val[i] {
 					output.val[i] = inputs[1].val[i]
 					output.dval[i] = inputs[1].dval[i]
@@ -920,8 +938,8 @@ vmax_ :: proc(graph: ^Graph, op: Op) {
 				}
 			}
 		}
-		if len(inputs[1].val) == 1 {
-			#no_bounds_check for i in 0 ..< len(inputs[0].val) {
+		if inputs[1].size == 1 {
+			#no_bounds_check for i in 0 ..< inputs[0].size {
 				if inputs[0].val[i] < inputs[1].val[0] {
 					output.val[i] = inputs[1].val[0]
 					output.dval[i] = inputs[1].dval[0]
@@ -939,7 +957,7 @@ vmax_vars :: proc(x, y: Var, name: string = "_max") -> Var {
 	assert(x.graph == y.graph)
 	graph := x.graph
 
-	z := var(graph, size = max(len(x.val), len(y.val)), name = name)
+	z := var(graph, size = max(x.size, y.size), name = name)
 
 	op: Op = {
 		inputs = [2]u64{x.id, y.id},
@@ -1215,7 +1233,7 @@ test_exp :: proc(t: ^testing.T) {
 
 	uncertainty(graph, x)
 
-	for i in 0 ..< len(x.val) {
+	for i in 0 ..< x.size {
 		testing.expect(t, math.abs(graph.vars[y.id].dval[i] - math.exp_f64(graph.vars[x.id].val[i])) < 1e-6)
 	}
 }
@@ -1267,7 +1285,7 @@ test_atan2 :: proc(t: ^testing.T) {
 	{
 		// Check basic results of atan2 in all four quadrants
 		z_answers := []f64{1.9655874, 1.5707963, 0.5280744, 0.0, -0.4993467, -1.5707963, -2.1587989, 3.1415926}
-		assert(len(z.val) == len(z_answers))
+		assert(z.size == u64(len(z_answers)))
 
 		end := len(z_answers) - 1
 		z_answers[end] *= math.sign(graph.vars[z.id].val[end]) // don't care about matching sign of pi
@@ -1280,7 +1298,7 @@ test_atan2 :: proc(t: ^testing.T) {
 	{
 		uncertainty(graph, x)
 		dz_answers := []f64{-0.7100591, -1.1111111, -0.3626943, 0.0, 0.3821656, 0.9090909, 0.5769230, 0.0}
-		assert(len(z.val) == len(dz_answers))
+		assert(z.size == u64(len(dz_answers)))
 
 		for i in 0 ..< len(dz_answers) {
 			testing.expect(t, math.abs(graph.vars[z.id].dval[i] - dz_answers[i]) < 1e-6, fmt.tprintf("dz/dx error\n"))
@@ -1290,10 +1308,11 @@ test_atan2 :: proc(t: ^testing.T) {
 	{
 		uncertainty(graph, y)
 		dz_answers := []f64{-0.29585799, 0.0, 0.62176166, 1.11111111, 0.70063694, 0.0, -0.38461538, -0.71428571}
-		assert(len(z.val) == len(dz_answers))
+		assert(z.size == u64(len(dz_answers)))
 
 		for i in 0 ..< len(dz_answers) {
 			testing.expect(t, math.abs(graph.vars[z.id].dval[i] - dz_answers[i]) < 1e-6, fmt.tprintf("dz/dy error\n"))
 		}
 	}
 }
+
